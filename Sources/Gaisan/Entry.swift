@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 @main
@@ -7,11 +8,12 @@ enum Entry {
     if CommandLine.arguments.contains("--print") {
       if let estimate = Scan.load() {
         print(
-          "today \(Money(dollars: estimate.today).label) · 7d \(Money(dollars: estimate.week).label) · all \(Money(dollars: estimate.allTime).label)"
+          "today \(Money(dollars: estimate.today.cost).label) · 7d \(Money(dollars: estimate.week.cost).label) · 30d \(Money(dollars: estimate.month.cost).label) · all \(Money(dollars: estimate.allTime.cost).label)"
         )
-        for source in estimate.sources {
-          let value = source.today.map { Money(dollars: $0).label } ?? "—"
-          print("\(source.name) today \(value)")
+        print(
+          "\(estimate.today.sessions) sessions today · \(estimate.allTime.sessions) all time")
+        for source in estimate.today.sources {
+          print("\(source.name) today \(Money(dollars: source.cost).label)")
         }
       } else {
         print("No local agent logs on this Mac.")
@@ -28,21 +30,21 @@ enum Entry {
 
 @MainActor
 final class GaisanDelegate: NSObject, NSApplicationDelegate {
+  private let board = Board()
   private var statusItem: NSStatusItem?
-  private var panel: NSWindow?
-  private var estimate: Estimate?
-  private var timer: Timer?
+  private var panel: NSPanel?
+  private var host: NSHostingView<AnyView>?
+  private var cancellables: Set<AnyCancellable> = []
+  private var mouseMonitor: Any?
 
   func applicationDidFinishLaunching(_ notification: Notification) {
-    reload()
-    if estimate?.hasLogs != true, !Scan.hasLogs() {
-      // Stay installed but keep the item off until logs appear.
-    }
     installStatusItem()
     applyTitle()
-    timer = Timer.scheduledTimer(withTimeInterval: 180, repeats: true) { [weak self] _ in
-      Task { @MainActor in self?.reloadAndApply() }
-    }
+    board.$estimate.receive(on: RunLoop.main).sink { [weak self] _ in
+      self?.applyTitle()
+      self?.layoutPanel()
+    }.store(in: &cancellables)
+    board.start()
   }
 
   private func installStatusItem() {
@@ -53,53 +55,63 @@ final class GaisanDelegate: NSObject, NSApplicationDelegate {
     statusItem = item
   }
 
-  private func reload() {
-    estimate = Scan.load()
-  }
-
-  private func reloadAndApply() {
-    reload()
-    applyTitle()
-    if panel?.isVisible == true, let content = panel?.contentView as? NSHostingView<PanelView> {
-      content.rootView = PanelView(estimate: estimate)
-    }
-  }
-
   private func applyTitle() {
-    let visible = estimate?.hasLogs == true || Scan.hasLogs()
+    let visible = board.estimate?.hasLogs == true || Scan.hasLogs() || board.loading
     statusItem?.isVisible = visible
     guard visible else { return }
-    let title = Money(dollars: estimate?.today ?? 0).ticker
+    let amount = Money(dollars: board.estimate?.today.cost ?? 0).ticker
+    let title = board.estimate == nil && board.loading ? "today …" : "today \(amount)"
     let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
     statusItem?.button?.attributedTitle = NSAttributedString(
-      string: title,
-      attributes: [.font: font, .foregroundColor: NSColor.labelColor]
-    )
+      string: title, attributes: [.font: font, .foregroundColor: NSColor.labelColor])
   }
 
   @objc private func togglePanel() {
     if panel?.isVisible == true {
-      panel?.orderOut(nil)
+      hidePanel()
       return
     }
-    reloadAndApply()
+    board.refresh(force: false)
     let window = panel ?? makePanel()
     panel = window
+    layoutPanel()
     placeUnderStatusItem(window)
-    window.makeKeyAndOrderFront(nil)
+    window.orderFront(nil)
+    listenForOutsideClicks()
   }
 
-  private func makePanel() -> NSWindow {
+  private func hidePanel() {
+    panel?.orderOut(nil)
+    if let monitor = mouseMonitor {
+      NSEvent.removeMonitor(monitor)
+      mouseMonitor = nil
+    }
+  }
+
+  private func makePanel() -> NSPanel {
+    let root = AnyView(PanelView().environmentObject(board))
+    let host = NSHostingView(rootView: root)
+    host.frame = NSRect(x: 0, y: 0, width: 400, height: 420)
+    self.host = host
     let window = NSPanel(
-      contentRect: NSRect(x: 0, y: 0, width: 300, height: 220),
-      styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+      contentRect: host.frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered,
+      defer: false)
     window.isOpaque = false
     window.backgroundColor = .clear
     window.hasShadow = true
     window.level = .statusBar
     window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-    window.contentView = NSHostingView(rootView: PanelView(estimate: estimate))
+    window.contentView = host
     return window
+  }
+
+  private func layoutPanel() {
+    guard let host, let panel else { return }
+    host.invalidateIntrinsicContentSize()
+    let size = host.fittingSize
+    let height = min(max(size.height, 180), 560)
+    panel.setContentSize(NSSize(width: 400, height: height))
+    placeUnderStatusItem(panel)
   }
 
   private func placeUnderStatusItem(_ window: NSWindow) {
@@ -107,11 +119,28 @@ final class GaisanDelegate: NSObject, NSApplicationDelegate {
       window.center()
       return
     }
-    var origin = NSPoint(x: anchor.midX - 150, y: anchor.minY - window.frame.height - 6)
+    var origin = NSPoint(x: anchor.midX - 200, y: anchor.minY - window.frame.height - 6)
     if let screen = statusItem?.button?.window?.screen ?? NSScreen.main {
       let bounds = screen.visibleFrame
-      origin.x = min(max(origin.x, bounds.minX + 8), bounds.maxX - 300 - 8)
+      origin.x = min(max(origin.x, bounds.minX + 8), bounds.maxX - 400 - 8)
+      origin.y = max(origin.y, bounds.minY + 8)
     }
     window.setFrameOrigin(origin)
+  }
+
+  private func listenForOutsideClicks() {
+    if mouseMonitor != nil { return }
+    mouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) {
+      [weak self] _ in
+      guard let self, let panel = self.panel, panel.isVisible else { return }
+      let point = NSEvent.mouseLocation
+      if panel.frame.contains(point) { return }
+      if let button = self.statusItem?.button, let frame = button.window?.frame,
+        frame.contains(point)
+      {
+        return
+      }
+      DispatchQueue.main.async { self.hidePanel() }
+    }
   }
 }

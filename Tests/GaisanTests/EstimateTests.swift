@@ -15,23 +15,25 @@ struct EstimateTests {
         "a.jsonl": [
           "p": "claude",
           "r": [
-            row(today, uncached: 1_000_000),
-            row(lastWeek, uncached: 1_000_000),
-            row(old, uncached: 1_000_000),
+            row(today, uncached: 1_000_000, session: 1),
+            row(lastWeek, uncached: 1_000_000, session: 1),
+            row(old, uncached: 1_000_000, session: 2),
           ],
         ],
         "b.jsonl": [
           "p": "codex",
-          "r": [row(today, output: 1_000_000)],
+          "r": [row(today, output: 1_000_000, session: 3)],
         ],
       ],
     ]
     let estimate = Scan.fold(cache: cache, rates: opusRates, now: now)
     #expect(estimate.hasLogs)
-    #expect(abs(estimate.allTime - 32) < 0.01)
-    #expect(abs(estimate.week - 28) < 0.01)
-    #expect(abs(estimate.today - 24) < 0.01)
-    #expect(estimate.sources.map(\.id) == ["claude", "codex"])
+    #expect(abs(estimate.allTime.cost - 32) < 0.01)
+    #expect(abs(estimate.week.cost - 28) < 0.01)
+    #expect(abs(estimate.today.cost - 24) < 0.01)
+    #expect(estimate.today.sources.map(\.id) == ["claude", "codex"])
+    #expect(estimate.today.sessions == 2)
+    #expect(estimate.allTime.sessions == 3)
     #expect(Money(dollars: 12.4).ticker == "≈$12.40")
     #expect(Money(dollars: 18_214).ticker == "≈$18,214")
   }
@@ -50,7 +52,10 @@ struct EstimateTests {
     ]
     let estimate = Scan.fold(cache: cache, rates: opusRates, now: now)
     // 1000*4e-6 + 10000*2e-7 + 2000*5e-6 + 500*2e-5 = 0.004 + 0.002 + 0.010 + 0.010 = 0.026
-    #expect(abs(estimate.today - 0.026) < 0.0001)
+    #expect(abs(estimate.today.cost - 0.026) < 0.0001)
+    #expect(abs(estimate.today.cacheRead - 0.002) < 0.0001)
+    #expect(abs(estimate.today.cacheSavings - 0.038) < 0.0001)
+    #expect(estimate.today.models.first?.id == "claude-opus-5-5")
   }
 
   @Test func reportedCostWinsOverListPrice() {
@@ -66,7 +71,7 @@ struct EstimateTests {
       ],
     ]
     let estimate = Scan.fold(cache: cache, rates: opusRates, now: now)
-    #expect(abs(estimate.today - 0.5) < 0.0001)
+    #expect(abs(estimate.today.cost - 0.5) < 0.0001)
   }
 
   @Test func syntheticAndBareFamilyNamesStayUnpriced() {
@@ -93,6 +98,18 @@ struct EstimateTests {
     #expect(abs(cost - 2) < 0.0001)
   }
 
+  @Test func snapshotMatchesFingerprint() {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "gaisan-snap-\(UUID().uuidString)")
+    let url = folder.appendingPathComponent("snapshot.json")
+    var estimate = Estimate.empty
+    estimate.fingerprint = "abc"
+    estimate.today.cost = 12
+    Scan.saveSnapshot(estimate, to: url)
+    #expect(Scan.loadSnapshot(matching: "abc", from: url)?.today.cost == 12)
+    #expect(Scan.loadSnapshot(matching: "other", from: url) == nil)
+  }
+
   @Test func missingLogsAreNil() {
     let empty = FileManager.default.temporaryDirectory.appendingPathComponent(
       "gaisan-empty-\(UUID().uuidString)")
@@ -117,10 +134,11 @@ struct EstimateTests {
 
   private func row(
     _ timestamp: Double, uncached: Double = 0, cached: Double = 0, created: Double = 0,
-    output: Double = 0, reported: Double? = nil, speed: Int = 0
+    output: Double = 0, reported: Double? = nil, speed: Int = 0, session: Int = 0
   ) -> [Any] {
     [
-      timestamp, 0, 0, uncached, cached, created, output, 0, NSNull(), reported as Any? ?? NSNull(),
+      timestamp, 0, session, uncached, cached, created, output, 0, NSNull(),
+      reported as Any? ?? NSNull(),
       speed, NSNull(),
     ]
   }
