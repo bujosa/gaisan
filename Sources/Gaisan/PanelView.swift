@@ -10,6 +10,7 @@ struct PanelView: View {
       if let estimate = board.estimate, estimate.hasLogs {
         let slice = estimate.slice(board.window)
         hero(slice)
+        HistoryChart(buckets: estimate.chart(board.window))
         sources(slice)
         mix(slice)
         models(slice)
@@ -87,7 +88,9 @@ struct PanelView: View {
   private func sources(_ slice: Slice) -> some View {
     let total = max(slice.cost, 0.0001)
     return VStack(alignment: .leading, spacing: 10) {
+      StackedShare(parts: slice.sources, total: total)
       ForEach(slice.sources) { source in
+        let idle = source.cost <= 0
         VStack(alignment: .leading, spacing: 4) {
           HStack(alignment: .firstTextBaseline, spacing: 8) {
             Circle().fill(Accent.color(for: source.id)).frame(width: 7, height: 7)
@@ -97,11 +100,13 @@ struct PanelView: View {
               .font(.caption2)
               .foregroundStyle(.tertiary)
             Spacer(minLength: 8)
-            Text(Money(dollars: source.cost).label)
+            Text(idle ? "—" : Money(dollars: source.cost).label)
               .font(.subheadline.weight(.medium).monospacedDigit())
+              .foregroundStyle(idle ? .tertiary : .primary)
           }
           Meter(used: source.cost / total * 100, accent: Accent.color(for: source.id))
         }
+        .opacity(idle ? 0.55 : 1)
       }
     }
   }
@@ -119,8 +124,10 @@ struct PanelView: View {
           Text("Mix")
             .font(.caption2)
             .foregroundStyle(.secondary)
+          MixBar(rows: rows)
           ForEach(rows, id: \.0) { row in
             HStack {
+              Circle().fill(Accent.mix(row.0)).frame(width: 6, height: 6)
               Text(row.0)
               Spacer()
               Text(Money(dollars: row.1).label)
@@ -189,10 +196,92 @@ enum Accent {
     switch id {
     case "claude": return Color(red: 0.85, green: 0.45, blue: 0.28)
     case "codex": return Color(red: 0.22, green: 0.68, blue: 0.48)
-    case "grok": return Color(red: 0.55, green: 0.58, blue: 0.64)
+    case "grok": return Color(red: 0.93, green: 0.76, blue: 0.28)
     case "pi": return Color(red: 0.62, green: 0.42, blue: 0.86)
     default: return Color.secondary
     }
+  }
+
+  static func mix(_ name: String) -> Color {
+    switch name {
+    case "Input": return Color(red: 0.45, green: 0.62, blue: 0.95)
+    case "Cache read": return Color(red: 0.38, green: 0.78, blue: 0.72)
+    case "Cache write": return Color(red: 0.95, green: 0.62, blue: 0.32)
+    case "Output": return Color(red: 0.78, green: 0.48, blue: 0.86)
+    default: return Color.secondary
+    }
+  }
+}
+
+struct HistoryChart: View {
+  var buckets: [StackBucket]
+
+  var body: some View {
+    let peak = max(buckets.map(\.total).max() ?? 0, 0.0001)
+    VStack(alignment: .leading, spacing: 6) {
+      HStack(alignment: .bottom, spacing: buckets.count > 40 ? 1 : 2) {
+        ForEach(buckets) { bucket in
+          VStack(spacing: 0) {
+            Spacer(minLength: 0)
+            ForEach(Array(bucket.layers.reversed())) { layer in
+              Rectangle()
+                .fill(Accent.color(for: layer.id))
+                .frame(height: max(52 * layer.cost / peak, layer.cost > 0 ? 0.6 : 0))
+            }
+          }
+          .frame(maxWidth: .infinity)
+          .frame(height: 52)
+          .background(
+            Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+          )
+        }
+      }
+      .frame(height: 52)
+      .accessibilityLabel("Usage over time")
+    }
+  }
+}
+
+struct StackedShare: View {
+  var parts: [SourceLine]
+  var total: Double
+
+  var body: some View {
+    GeometryReader { geo in
+      HStack(spacing: 1) {
+        ForEach(parts.filter { $0.cost > 0 }) { part in
+          Capsule()
+            .fill(Accent.color(for: part.id))
+            .frame(width: max(geo.size.width * part.cost / total, 2))
+        }
+        if parts.allSatisfy({ $0.cost <= 0 }) {
+          Capsule().fill(Color.primary.opacity(0.08))
+        }
+      }
+    }
+    .frame(height: 8)
+    .clipShape(Capsule())
+    .background(Capsule().fill(Color.primary.opacity(0.06)))
+  }
+}
+
+struct MixBar: View {
+  var rows: [(String, Double)]
+
+  var body: some View {
+    let total = max(rows.map(\.1).reduce(0, +), 0.0001)
+    GeometryReader { geo in
+      HStack(spacing: 1) {
+        ForEach(rows, id: \.0) { row in
+          Capsule()
+            .fill(Accent.mix(row.0))
+            .frame(width: max(geo.size.width * row.1 / total, 2))
+        }
+      }
+    }
+    .frame(height: 8)
+    .clipShape(Capsule())
+    .background(Capsule().fill(Color.primary.opacity(0.06)))
   }
 }
 

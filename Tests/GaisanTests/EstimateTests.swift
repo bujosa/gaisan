@@ -36,6 +36,26 @@ struct EstimateTests {
     #expect(estimate.allTime.sessions == 3)
     #expect(Money(dollars: 12.4).ticker == "≈$12.40")
     #expect(Money(dollars: 18_214).ticker == "≈$18,214")
+    #expect(estimate.hours.count == 24)
+    #expect((89...91).contains(estimate.days.count))
+  }
+
+  @Test func grokStaysVisibleOnAQuietDay() {
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    let today = now.timeIntervalSince1970 * 1000
+    let lastMonth = (now.timeIntervalSince1970 - 86_400 * 10) * 1000
+    let cache: [String: Any] = [
+      "models": ["claude-opus-5-5"],
+      "files": [
+        "a.jsonl": ["p": "claude", "r": [row(today, uncached: 1_000_000, session: 1)]],
+        "g.jsonl": ["p": "grok", "r": [row(lastMonth, uncached: 1_000_000, session: 9)]],
+      ],
+    ]
+    let estimate = Scan.fold(cache: cache, rates: opusRates, now: now)
+    #expect(estimate.today.sources.map(\.id) == ["claude", "grok"])
+    #expect(estimate.today.sources.first { $0.id == "grok" }?.cost == 0)
+    #expect(estimate.month.sources.contains { $0.id == "grok" && $0.cost > 0 })
+    #expect(estimate.chart(.today).contains { $0.claude > 0 })
   }
 
   @Test func cacheTokensUseDiscountAndPremiumRates() {

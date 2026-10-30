@@ -68,11 +68,42 @@ struct Slice: Sendable, Equatable, Codable {
   }
 }
 
+struct StackBucket: Sendable, Equatable, Identifiable, Codable {
+  var id: String
+  var claude: Double = 0
+  var codex: Double = 0
+  var grok: Double = 0
+  var pi: Double = 0
+  var other: Double = 0
+
+  var total: Double { claude + codex + grok + pi + other }
+
+  var layers: [SourceLine] {
+    [
+      SourceLine(id: "claude", name: "Claude", cost: claude, sessions: 0),
+      SourceLine(id: "codex", name: "Codex", cost: codex, sessions: 0),
+      SourceLine(id: "grok", name: "Grok", cost: grok, sessions: 0),
+      SourceLine(id: "pi", name: "Pi", cost: pi, sessions: 0),
+    ].filter { $0.cost > 0 }
+  }
+
+  static func from(_ costs: [String: Double], id: String) -> StackBucket {
+    StackBucket(
+      id: id, claude: costs["claude"] ?? 0, codex: costs["codex"] ?? 0, grok: costs["grok"] ?? 0,
+      pi: costs["pi"] ?? 0,
+      other: costs.filter { !["claude", "codex", "grok", "pi"].contains($0.key) }.values.reduce(
+        0, +)
+    )
+  }
+}
+
 struct Estimate: Sendable, Equatable, Codable {
   var today: Slice
   var week: Slice
   var month: Slice
   var allTime: Slice
+  var hours: [StackBucket] = []
+  var days: [StackBucket] = []
   var hasLogs: Bool
   var fingerprint: String
 
@@ -82,6 +113,15 @@ struct Estimate: Sendable, Equatable, Codable {
     case .week: return week
     case .month: return month
     case .all: return allTime
+    }
+  }
+
+  func chart(_ window: Window) -> [StackBucket] {
+    switch window {
+    case .today: return hours
+    case .week: return Array(days.suffix(7))
+    case .month: return Array(days.suffix(30))
+    case .all: return days
     }
   }
 
@@ -162,7 +202,7 @@ enum Scan {
     let modified = (values?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
     let size = (values?[.size] as? NSNumber)?.intValue ?? 0
     let day = Int(Calendar.current.startOfDay(for: now).timeIntervalSince1970)
-    return "\(size)-\(modified)-\(day)"
+    return "v2-\(size)-\(modified)-\(day)"
   }
 
   static func loadSnapshot(matching fingerprint: String, from url: URL = snapshotURL) -> Estimate? {
@@ -209,10 +249,13 @@ enum Scan {
     let startOfToday = calendar.startOfDay(for: now)
     let weekAgo = calendar.date(byAdding: .day, value: -7, to: now) ?? now
     let monthAgo = calendar.date(byAdding: .day, value: -30, to: now) ?? now
+    let chartStart = calendar.date(byAdding: .day, value: -89, to: startOfToday) ?? startOfToday
     var today = Bucket()
     var week = Bucket()
     var month = Bucket()
     var allTime = Bucket()
+    var hours = Array(repeating: [String: Double](), count: 24)
+    var days: [Int: [String: Double]] = [:]
 
     for (_, value) in files {
       guard let rec = value as? [String: Any] else { continue }
@@ -243,13 +286,35 @@ enum Scan {
         }
         if stamp >= startOfToday {
           today.add(provider: provider, session: session, model: model, priced: priced)
+          hours[calendar.component(.hour, from: stamp)][provider, default: 0] += priced.cost
+        }
+        if stamp >= chartStart {
+          let day = Int(calendar.startOfDay(for: stamp).timeIntervalSince1970.rounded())
+          days[day, default: [:]][provider, default: 0] += priced.cost
         }
       }
     }
 
+    let known = allTime.slice().sources
     return Estimate(
-      today: today.slice(), week: week.slice(), month: month.slice(), allTime: allTime.slice(),
+      today: today.slice(carrying: known), week: week.slice(carrying: known),
+      month: month.slice(carrying: known), allTime: allTime.slice(),
+      hours: (0..<24).map { StackBucket.from(hours[$0], id: "h\($0)") },
+      days: paddedDays(days, from: chartStart, through: startOfToday, calendar: calendar),
       hasLogs: true, fingerprint: "")
+  }
+
+  private static func paddedDays(
+    _ days: [Int: [String: Double]], from start: Date, through end: Date, calendar: Calendar
+  ) -> [StackBucket] {
+    var cursor = start
+    var buckets: [StackBucket] = []
+    while cursor <= end {
+      let key = Int(cursor.timeIntervalSince1970.rounded())
+      buckets.append(StackBucket.from(days[key] ?? [:], id: "d\(key)"))
+      cursor = calendar.date(byAdding: .day, value: 1, to: cursor) ?? end.addingTimeInterval(1)
+    }
+    return buckets
   }
 
   /// Same layout T3 writes: uncached, cached, cache-create, output. Reasoning is already inside output.
@@ -373,17 +438,26 @@ enum Scan {
       }
     }
 
-    func slice() -> Slice {
+    func slice(carrying known: [SourceLine] = []) -> Slice {
       var sources: [SourceLine] = []
+      var seen: Set<String> = []
       for id in sourceOrder where sourceCost[id] != nil || sourceSessions[id] != nil {
+        seen.insert(id)
         sources.append(
           SourceLine(
             id: id, name: sourceNames[id] ?? id, cost: sourceCost[id] ?? 0,
             sessions: sourceSessions[id]?.count ?? 0))
       }
-      for (id, cost) in sourceCost where !sourceOrder.contains(id) {
+      for source in known where !seen.contains(source.id) {
+        seen.insert(source.id)
+        sources.append(SourceLine(id: source.id, name: source.name, cost: 0, sessions: 0))
+      }
+      for (id, cost) in sourceCost where !seen.contains(id) {
         sources.append(
           SourceLine(id: id, name: id, cost: cost, sessions: sourceSessions[id]?.count ?? 0))
+      }
+      sources.sort {
+        (sourceOrder.firstIndex(of: $0.id) ?? 99) < (sourceOrder.firstIndex(of: $1.id) ?? 99)
       }
       let models =
         modelCost
