@@ -45,6 +45,46 @@ final class GaisanDelegate: NSObject, NSApplicationDelegate {
       self?.layoutPanel()
     }.store(in: &cancellables)
     board.start()
+    if snapshotPath() != nil || CommandLine.arguments.contains("--panel") {
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+        guard let self else { return }
+        self.togglePanel()
+        if let path = self.snapshotPath() {
+          DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.writePanelImage(to: path)
+            NSApp.terminate(nil)
+          }
+        }
+      }
+    }
+  }
+
+  private func snapshotPath() -> String? {
+    let arguments = CommandLine.arguments
+    guard let index = arguments.firstIndex(of: "--snapshot"), arguments.indices.contains(index + 1)
+    else {
+      return nil
+    }
+    return arguments[index + 1]
+  }
+
+  private func writePanelImage(to path: String) {
+    guard let host else {
+      fputs("gaisan: couldn't capture the panel\n", stderr)
+      return
+    }
+    host.layoutSubtreeIfNeeded()
+    let bounds = host.bounds
+    guard let rep = host.bitmapImageRepForCachingDisplay(in: bounds) else {
+      fputs("gaisan: couldn't capture the panel\n", stderr)
+      return
+    }
+    host.cacheDisplay(in: bounds, to: rep)
+    let url = URL(fileURLWithPath: path)
+    try? FileManager.default.createDirectory(
+      at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    guard let data = rep.representation(using: .png, properties: [:]) else { return }
+    try? data.write(to: url)
   }
 
   private func installStatusItem() {
