@@ -130,6 +130,78 @@ struct EstimateTests {
     #expect(Scan.loadSnapshot(matching: "other", from: url) == nil)
   }
 
+  @Test func liveClaudeAndCodexFillTodayWhenCacheIsStale() {
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    let extra = [
+      Live.Event(
+        stamp: now, provider: "claude", session: 1, model: "claude-opus-5-5", speed: "standard",
+        uncached: 1_000_000, cached: 0, created: 0, output: 0, reported: nil),
+      Live.Event(
+        stamp: now, provider: "codex", session: 2, model: "claude-opus-5-5", speed: "standard",
+        uncached: 0, cached: 0, created: 0, output: 1_000_000, reported: nil),
+    ]
+    let estimate = Scan.fold(cache: ["files": [:]], rates: opusRates, now: now, extra: extra)
+    #expect(abs(estimate.today.cost - 24) < 0.01)
+    #expect(estimate.today.sessions == 2)
+    #expect(estimate.today.sources.map(\.id) == ["claude", "codex"])
+  }
+
+  @Test func claudeJsonlCountsEachRequestOnce() throws {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "gaisan-claude-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let stamp = "2026-11-01T10:00:00.000Z"
+    let line = { (request: String) in
+      """
+      {"type":"assistant","timestamp":"\(stamp)","sessionId":"sess-1","requestId":"\(request)","message":{"model":"claude-opus-5-5","usage":{"input_tokens":100,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":0,"speed":"standard"}}}
+      """
+    }
+    try Data((line("req-1") + "\n" + line("req-1") + "\n" + line("req-2") + "\n").utf8)
+      .write(to: folder.appendingPathComponent("chat.jsonl"))
+    let since = Date(timeIntervalSince1970: 1_793_500_000)
+    let events = Live.events(since: since, trees: [("claude", folder)])
+    #expect(events.count == 2)
+    #expect(events.allSatisfy { $0.provider == "claude" && $0.uncached == 100 })
+  }
+
+  @Test func codexTokenUsageUsesTurnModel() throws {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "gaisan-codex-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let jsonl = """
+      {"timestamp":"2026-11-01T10:00:00.000Z","type":"turn_context","payload":{"model":"gpt-6.1-sol"}}
+      {"timestamp":"2026-11-01T10:00:01.000Z","type":"token_usage_record","payload":{"session_id":"sess-9","usage":{"input_tokens":150,"cached_input_tokens":50,"cache_write_input_tokens":10,"output_tokens":20}}}
+      """
+    try Data(jsonl.utf8).write(to: folder.appendingPathComponent("rollout.jsonl"))
+    let events = Live.events(
+      since: Date(timeIntervalSince1970: 1_793_500_000), trees: [("codex", folder)])
+    #expect(events.count == 1)
+    guard events.count == 1 else { return }
+    #expect(events[0].provider == "codex")
+    #expect(events[0].model == "gpt-6.1-sol")
+    #expect(events[0].uncached == 100)
+    #expect(events[0].cached == 50)
+    #expect(events[0].created == 10)
+    #expect(events[0].output == 20)
+  }
+
+  @Test func liveMarkChangesWhenALogGrows() throws {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "gaisan-mark-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let file = folder.appendingPathComponent("chat.jsonl")
+    try Data("{}\n".utf8).write(to: file)
+    let since = Date(timeIntervalSince1970: 0)
+    let first = Live.mark(trees: [("claude", folder)], since: since)
+    try Data("{}\n{}\n".utf8).write(to: file)
+    let second = Live.mark(trees: [("claude", folder)], since: since)
+    #expect(first.count == 1)
+    #expect(second.bytes > first.bytes)
+  }
+
   @Test func missingLogsAreNil() {
     let empty = FileManager.default.temporaryDirectory.appendingPathComponent(
       "gaisan-empty-\(UUID().uuidString)")

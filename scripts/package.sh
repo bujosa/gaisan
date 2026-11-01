@@ -2,7 +2,7 @@
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
-version="0.1.0"
+version="0.2.0"
 # One universal build. install.sh uses the universal app; the release ships one thin app per chip.
 archs=(--arch arm64 --arch x86_64)
 swift build -c release "${archs[@]}"
@@ -47,7 +47,7 @@ make_app() {
   <key>CFBundleShortVersionString</key>
   <string>${version}</string>
   <key>CFBundleVersion</key>
-  <string>1</string>
+  <string>2</string>
   <key>LSMinimumSystemVersion</key>
   <string>14.0</string>
   <key>CFBundleDevelopmentRegion</key>

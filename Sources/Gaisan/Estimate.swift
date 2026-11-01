@@ -195,14 +195,24 @@ enum Scan {
     return sessions.contains { fileManager.fileExists(atPath: $0.path) }
   }
 
-  static func fingerprint(
+  static func historyFingerprint(
     cache: URL = cacheURL, now: Date = Date(), fileManager: FileManager = .default
   ) -> String {
     let values = try? fileManager.attributesOfItem(atPath: cache.path)
     let modified = (values?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
     let size = (values?[.size] as? NSNumber)?.intValue ?? 0
     let day = Int(Calendar.current.startOfDay(for: now).timeIntervalSince1970)
-    return "v2-\(size)-\(modified)-\(day)"
+    return "v3-\(size)-\(modified)-\(day)"
+  }
+
+  static func fingerprint(
+    cache: URL = cacheURL, sessions: [URL] = sessionRoots, now: Date = Date(),
+    fileManager: FileManager = .default
+  ) -> String {
+    let day = Calendar.current.startOfDay(for: now)
+    let live = Live.mark(since: day, fileManager: fileManager)
+    return
+      "\(historyFingerprint(cache: cache, now: now, fileManager: fileManager))-\(live.count)-\(live.bytes)-\(live.newest)"
   }
 
   static func loadSnapshot(matching fingerprint: String, from url: URL = snapshotURL) -> Estimate? {
@@ -225,22 +235,117 @@ enum Scan {
     now: Date = Date(), fileManager: FileManager = .default
   ) -> Estimate? {
     guard hasLogs(cache: cache, sessions: sessions, fileManager: fileManager) else { return nil }
-    let mark = fingerprint(cache: cache, now: now, fileManager: fileManager)
-    if let cached = loadSnapshot(matching: mark) { return cached }
-    guard let cacheData = try? Data(contentsOf: cache),
-      let cacheJSON = try? JSONSerialization.jsonObject(with: cacheData) as? [String: Any],
-      let ratesData = try? Data(contentsOf: rates),
-      let ratesJSON = try? JSONSerialization.jsonObject(with: ratesData) as? [String: Any]
-    else {
-      return Estimate.empty
+    let mark = fingerprint(cache: cache, sessions: sessions, now: now, fileManager: fileManager)
+    let historyMark = historyFingerprint(cache: cache, now: now, fileManager: fileManager)
+    let ratesJSON =
+      (try? Data(contentsOf: rates)).flatMap {
+        try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
+      } ?? [:]
+    var history = loadSnapshot(matching: historyMark)
+    if history == nil {
+      let cacheJSON =
+        (try? Data(contentsOf: cache)).flatMap {
+          try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
+        } ?? [:]
+      var folded = fold(cache: cacheJSON, rates: ratesJSON, now: now)
+      folded.fingerprint = historyMark
+      saveSnapshot(folded)
+      history = folded
     }
-    var estimate = fold(cache: cacheJSON, rates: ratesJSON, now: now)
+    let cacheDate =
+      (try? fileManager.attributesOfItem(atPath: cache.path))?[.modificationDate]
+      as? Date
+    let startOfToday = Calendar.current.startOfDay(for: now)
+    let cutoff = [cacheDate, startOfToday].compactMap { $0 }.max() ?? startOfToday
+    let extra = Live.events(since: cutoff, fileManager: fileManager)
+    var estimate = history ?? Estimate.empty
+    if !extra.isEmpty {
+      estimate = plus(fold(cache: [:], rates: ratesJSON, now: now, extra: extra), onto: estimate)
+    }
+    estimate.hasLogs = true
     estimate.fingerprint = mark
-    saveSnapshot(estimate)
     return estimate
   }
 
-  static func fold(cache: [String: Any], rates: [String: Any], now: Date) -> Estimate {
+  static func plus(_ overlay: Estimate, onto base: Estimate) -> Estimate {
+    var days: [String: StackBucket] = [:]
+    for bucket in base.days + overlay.days {
+      var current = days[bucket.id] ?? StackBucket(id: bucket.id)
+      current.claude += bucket.claude
+      current.codex += bucket.codex
+      current.grok += bucket.grok
+      current.pi += bucket.pi
+      current.other += bucket.other
+      days[bucket.id] = current
+    }
+    let hours: [StackBucket]
+    if base.hours.count == 24, overlay.hours.count == 24 {
+      hours = zip(base.hours, overlay.hours).map { left, right in
+        StackBucket(
+          id: left.id, claude: left.claude + right.claude, codex: left.codex + right.codex,
+          grok: left.grok + right.grok, pi: left.pi + right.pi, other: left.other + right.other)
+      }
+    } else {
+      hours = overlay.hours.isEmpty ? base.hours : overlay.hours
+    }
+    let orderedDays =
+      base.days.isEmpty
+      ? overlay.days
+      : base.days.map { days[$0.id] ?? $0 }
+    return Estimate(
+      today: add(base.today, overlay.today), week: add(base.week, overlay.week),
+      month: add(base.month, overlay.month), allTime: add(base.allTime, overlay.allTime),
+      hours: hours, days: orderedDays, hasLogs: true, fingerprint: "")
+  }
+
+  private static func add(_ left: Slice, _ right: Slice) -> Slice {
+    var sourceMap: [String: SourceLine] = [:]
+    for source in left.sources + right.sources {
+      var current =
+        sourceMap[source.id]
+        ?? SourceLine(
+          id: source.id, name: source.name, cost: 0, sessions: 0)
+      current.cost += source.cost
+      current.sessions += source.sessions
+      sourceMap[source.id] = current
+    }
+    var sources = Array(sourceMap.values)
+    sources.sort {
+      (sourceOrder.firstIndex(of: $0.id) ?? 99) < (sourceOrder.firstIndex(of: $1.id) ?? 99)
+    }
+    var modelMap: [String: Double] = [:]
+    for model in left.models + right.models { modelMap[model.id, default: 0] += model.cost }
+    let models =
+      modelMap.sorted { $0.value > $1.value }.prefix(6).map {
+        ModelLine(id: $0.key, name: $0.key, cost: $0.value)
+      }
+    return Slice(
+      cost: left.cost + right.cost, sessions: left.sessions + right.sessions,
+      records: left.records + right.records, unpriced: left.unpriced + right.unpriced,
+      input: left.input + right.input, cacheRead: left.cacheRead + right.cacheRead,
+      cacheWrite: left.cacheWrite + right.cacheWrite, output: left.output + right.output,
+      cacheSavings: left.cacheSavings + right.cacheSavings, sources: sources, models: Array(models))
+  }
+
+  static func trees(from sessions: [URL]) -> [(provider: String, root: URL)] {
+    let known = Live.trees()
+    return sessions.map { root in
+      (known.first { $0.root.path == root.path }?.provider ?? providerName(root), root)
+    }
+  }
+
+  private static func providerName(_ root: URL) -> String {
+    let path = root.path
+    if path.contains("/.claude/") { return "claude" }
+    if path.contains("/.codex/") { return "codex" }
+    if path.contains("/.grok/") { return "grok" }
+    if path.contains("/.pi/") { return "pi" }
+    return root.lastPathComponent
+  }
+
+  static func fold(
+    cache: [String: Any], rates: [String: Any], now: Date, extra: [Live.Event] = []
+  ) -> Estimate {
     let models = cache["models"] as? [String] ?? []
     let document = rates["document"] as? [String: Any] ?? rates
     let table = parseRateTable(document)
@@ -292,6 +397,32 @@ enum Scan {
           let day = Int(calendar.startOfDay(for: stamp).timeIntervalSince1970.rounded())
           days[day, default: [:]][provider, default: 0] += priced.cost
         }
+      }
+    }
+
+    for event in extra {
+      let priced = pricing(
+        model: event.model, speed: event.speed, uncached: event.uncached, cached: event.cached,
+        created: event.created, output: event.output, reported: event.reported, table: table)
+      allTime.add(
+        provider: event.provider, session: event.session, model: event.model, priced: priced)
+      if event.stamp >= monthAgo {
+        month.add(
+          provider: event.provider, session: event.session, model: event.model, priced: priced)
+      }
+      if event.stamp >= weekAgo {
+        week.add(
+          provider: event.provider, session: event.session, model: event.model, priced: priced)
+      }
+      if event.stamp >= startOfToday {
+        today.add(
+          provider: event.provider, session: event.session, model: event.model, priced: priced)
+        hours[calendar.component(.hour, from: event.stamp)][event.provider, default: 0] +=
+          priced.cost
+      }
+      if event.stamp >= chartStart {
+        let day = Int(calendar.startOfDay(for: event.stamp).timeIntervalSince1970.rounded())
+        days[day, default: [:]][event.provider, default: 0] += priced.cost
       }
     }
 
