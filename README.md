@@ -4,7 +4,7 @@
 
 # Gaisan
 
-Menu bar app for macOS. It shows an API-price estimate of local Claude, Codex, Grok, and Pi logs. This is not a bill. The ticker is **today** plus the amount, and it updates when the local usage cache changes. Click it for Today / 7d / 30d / All, source mix, cache savings, and top models.
+Menu bar app for macOS. It shows an API-price estimate of local Claude, Codex, Grok, and Pi logs. This is not a bill. The ticker is **today** plus the amount, and it updates when those local logs change. Click it for Today / 7d / 30d / All, source mix, cache savings, and top models.
 
 <p align="center">
   <img src="docs/panel.png" alt="Gaisan panel with today's API-price estimate, source mix, and models" width="400">
@@ -42,9 +42,9 @@ Download the zip for your Mac from the [releases page](https://github.com/bujosa
 ./scripts/install.sh
 ```
 
-That builds a universal release binary (arm64 and x86_64), installs `~/Applications/Gaisan.app`, and opens it. `./scripts/package.sh` writes the signed universal app plus one signed zip and SHA-256 checksum per chip, `dist/Gaisan-0.1.0-macOS-apple-silicon.zip` and `dist/Gaisan-0.1.0-macOS-intel.zip`, without installing anything. It stops if either architecture is missing.
+That builds a universal release binary (arm64 and x86_64), installs `~/Applications/Gaisan.app`, and opens it. `./scripts/package.sh` writes the signed universal app plus one signed zip and SHA-256 checksum per chip, `dist/Gaisan-0.2.0-macOS-apple-silicon.zip` and `dist/Gaisan-0.2.0-macOS-intel.zip`, without installing anything. It stops if either architecture is missing.
 
-Run `swift test` for estimate folding, cache-aware prices, snapshot reuse, and idle Grok rows. Run `swift build -c release --arch arm64 --arch x86_64` to check the release build. CI runs both, plus `swift format lint --strict` and a script check, on every pull request.
+Run `swift test` for estimate folding, live Claude/Codex log parsing, cache-aware prices, snapshot reuse, and idle Grok rows. Run `swift build -c release --arch arm64 --arch x86_64` to check the release build. CI runs both, plus `swift format lint --strict` and a script check, on every pull request.
 
 `swift run Gaisan --print` prints today's / 7-day / 30-day / all-time totals without opening the menu bar.
 
@@ -70,7 +70,7 @@ Gaisan reads files already on this Mac. It does not ask for an API key and it do
 | Grok | `~/.grok/sessions` |
 | Pi | `~/.pi/agent/sessions` |
 
-Rows are folded from the usage scan cache at `~/.t3/userdata/usage-scan-cache-v5.json`, with rates from `~/.t3/userdata/usage-model-rates.json` when that file is present. Pricing uses uncached input, cache reads, cache writes, and output. Reasoning tokens are already inside output. A snapshot at `~/Library/Caches/Gaisan/snapshot.json` keeps the panel instant on the next open.
+Today is priced from the session logs themselves. Gaisan watches `~/.claude/projects` and `~/.codex/sessions` and folds new Claude assistant usage and Codex `token_usage_record` lines as they land. A longer history still folds from `~/.t3/userdata/usage-scan-cache-v5.json` when that file is present, with rates from `~/.t3/userdata/usage-model-rates.json`. Pricing uses uncached input, cache reads, cache writes, and output. Reasoning tokens are already inside output. A snapshot at `~/Library/Caches/Gaisan/snapshot.json` keeps the panel instant on the next open.
 
 This is an estimate, not a statement from Anthropic, OpenAI, xAI, or anyone else.
 
