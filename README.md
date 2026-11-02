@@ -50,7 +50,7 @@ Run `swift test` for estimate folding, live Claude/Codex log parsing, cache-awar
 
 ## What the panel shows
 
-- **Today / 7d / 30d / All.** The same local logs, cut to that window. The menu bar always shows today.
+- **Today / Yday / 7d / 30d / All.** The same local logs, cut to that window. The menu bar always shows today. All and the longer windows keep growing from live Claude and Codex logs even when the usage-scan cache is stale.
 - **Sources.** Claude, Codex, Grok, and Pi when those logs exist on this Mac. A quiet source still appears as a dash so the mix does not jump around.
 - **Mix.** Uncached input, cache reads, cache writes, and output, priced separately. Cache savings is what those reads would have cost at the uncached input rate.
 - **Models.** Highest spend first in the selected window.
@@ -70,7 +70,7 @@ Gaisan reads files already on this Mac. It does not ask for an API key and it do
 | Grok | `~/.grok/sessions` |
 | Pi | `~/.pi/agent/sessions` |
 
-Today is priced from the session logs themselves. Gaisan watches `~/.claude/projects` and `~/.codex/sessions` and folds new Claude assistant usage and Codex `token_usage_record` lines as they land. A longer history still folds from `~/.t3/userdata/usage-scan-cache-v5.json` when that file is present, with rates from `~/.t3/userdata/usage-model-rates.json`. Pricing uses uncached input, cache reads, cache writes, and output. Reasoning tokens are already inside output. A snapshot at `~/Library/Caches/Gaisan/snapshot.json` keeps the panel instant on the next open.
+Today and yesterday are priced from the session logs themselves. Gaisan watches `~/.claude/projects` and `~/.codex/sessions` and folds new Claude assistant usage and Codex `token_usage_record` lines as they land, from the moment the usage-scan cache last changed forward, so All / 7d / 30d do not freeze when that cache is stale. A longer history still folds from `~/.t3/userdata/usage-scan-cache-v5.json` when that file is present, with rates from `~/.t3/userdata/usage-model-rates.json`. Pricing uses uncached input, cache reads, cache writes, and output. Reasoning tokens are already inside output. A snapshot at `~/Library/Caches/Gaisan/snapshot.json` keeps the panel instant on the next open.
 
 This is an estimate, not a statement from Anthropic, OpenAI, xAI, or anyone else.
 

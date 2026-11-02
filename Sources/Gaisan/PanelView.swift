@@ -56,7 +56,7 @@ struct PanelView: View {
         } label: {
           Text(window.title)
             .font(.caption.weight(.semibold))
-            .padding(.horizontal, 10)
+            .padding(.horizontal, 8)
             .padding(.vertical, 5)
             .background(
               Capsule(style: .continuous)

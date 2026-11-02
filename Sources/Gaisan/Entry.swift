@@ -8,12 +8,16 @@ enum Entry {
     if CommandLine.arguments.contains("--print") {
       if let estimate = Scan.load() {
         print(
-          "today \(Money(dollars: estimate.today.cost).label) · 7d \(Money(dollars: estimate.week.cost).label) · 30d \(Money(dollars: estimate.month.cost).label) · all \(Money(dollars: estimate.allTime.cost).label)"
+          "today \(Money(dollars: estimate.today.cost).label) · yesterday \(Money(dollars: estimate.yesterday.cost).label) · 7d \(Money(dollars: estimate.week.cost).label) · 30d \(Money(dollars: estimate.month.cost).label) · all \(Money(dollars: estimate.allTime.cost).label)"
         )
         print(
-          "\(estimate.today.sessions) sessions today · \(estimate.allTime.sessions) all time")
+          "\(estimate.today.sessions) sessions today · \(estimate.yesterday.sessions) yesterday · \(estimate.allTime.sessions) all time"
+        )
         for source in estimate.today.sources {
           print("\(source.name) today \(Money(dollars: source.cost).label)")
+        }
+        for source in estimate.yesterday.sources where source.cost > 0 {
+          print("\(source.name) yesterday \(Money(dollars: source.cost).label)")
         }
       } else {
         print("No local agent logs on this Mac.")

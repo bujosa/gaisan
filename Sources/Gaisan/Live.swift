@@ -86,9 +86,8 @@ enum Live {
     }
     let calendar = Calendar.current
     let today = calendar.startOfDay(for: Date())
-    var day =
-      calendar.date(byAdding: .day, value: -7, to: calendar.startOfDay(for: since))
-      ?? calendar.startOfDay(for: since)
+    // Only day folders from the cache cutoff forward — never walk multi-gigabyte older months.
+    var day = calendar.startOfDay(for: since)
     var files: [URL] = []
     while day <= today {
       let year = calendar.component(.year, from: day)
@@ -97,15 +96,9 @@ enum Live {
       let folder = root.appendingPathComponent(
         String(format: "%04d/%02d/%02d", year, month, dayNumber))
       if let names = try? fileManager.contentsOfDirectory(
-        at: folder, includingPropertiesForKeys: [.contentModificationDateKey])
+        at: folder, includingPropertiesForKeys: nil)
       {
-        for url in names where url.pathExtension == "jsonl" {
-          let modified =
-            (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
-            .contentModificationDate
-          if let modified, modified < since, day < today { continue }
-          files.append(url)
-        }
+        files.append(contentsOf: names.filter { $0.pathExtension == "jsonl" })
       }
       guard let next = calendar.date(byAdding: .day, value: 1, to: day), next > day else { break }
       day = next

@@ -144,6 +144,37 @@ struct EstimateTests {
     #expect(abs(estimate.today.cost - 24) < 0.01)
     #expect(estimate.today.sessions == 2)
     #expect(estimate.today.sources.map(\.id) == ["claude", "codex"])
+    #expect(abs(estimate.allTime.cost - 24) < 0.01)
+  }
+
+  @Test func yesterdayIsSeparateFromToday() {
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    let startOfToday = Calendar.current.startOfDay(for: now)
+    let yesterdayNoon =
+      Calendar.current.date(
+        byAdding: .hour, value: 12,
+        to:
+          Calendar.current.date(byAdding: .day, value: -1, to: startOfToday) ?? startOfToday)
+      ?? now.addingTimeInterval(-86_400)
+    let cache: [String: Any] = [
+      "models": ["claude-opus-5-5"],
+      "files": [
+        "a.jsonl": [
+          "p": "claude",
+          "r": [
+            row(now.timeIntervalSince1970 * 1000, uncached: 1_000_000, session: 1),
+            row(yesterdayNoon.timeIntervalSince1970 * 1000, uncached: 500_000, session: 2),
+          ],
+        ]
+      ],
+    ]
+    let estimate = Scan.fold(cache: cache, rates: opusRates, now: now)
+    #expect(abs(estimate.today.cost - 4) < 0.01)
+    #expect(abs(estimate.yesterday.cost - 2) < 0.01)
+    #expect(estimate.yesterday.sessions == 1)
+    #expect(estimate.yesterdayHours.count == 24)
+    #expect(estimate.chart(.yesterday).contains { $0.claude > 0 })
+    #expect(Window.allCases.map(\.title) == ["Today", "Yday", "7d", "30d", "All"])
   }
 
   @Test func claudeJsonlCountsEachRequestOnce() throws {
