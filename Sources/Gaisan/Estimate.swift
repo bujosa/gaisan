@@ -23,13 +23,14 @@ struct Money: Sendable, Equatable {
 }
 
 enum Window: String, Sendable, CaseIterable, Identifiable {
-  case today, week, month, all
+  case today, yesterday, week, month, all
 
   var id: String { rawValue }
 
   var title: String {
     switch self {
     case .today: return "Today"
+    case .yesterday: return "Yday"
     case .week: return "7d"
     case .month: return "30d"
     case .all: return "All"
@@ -99,10 +100,12 @@ struct StackBucket: Sendable, Equatable, Identifiable, Codable {
 
 struct Estimate: Sendable, Equatable, Codable {
   var today: Slice
+  var yesterday: Slice = Slice()
   var week: Slice
   var month: Slice
   var allTime: Slice
   var hours: [StackBucket] = []
+  var yesterdayHours: [StackBucket] = []
   var days: [StackBucket] = []
   var hasLogs: Bool
   var fingerprint: String
@@ -110,6 +113,7 @@ struct Estimate: Sendable, Equatable, Codable {
   func slice(_ window: Window) -> Slice {
     switch window {
     case .today: return today
+    case .yesterday: return yesterday
     case .week: return week
     case .month: return month
     case .all: return allTime
@@ -119,6 +123,7 @@ struct Estimate: Sendable, Equatable, Codable {
   func chart(_ window: Window) -> [StackBucket] {
     switch window {
     case .today: return hours
+    case .yesterday: return yesterdayHours
     case .week: return Array(days.suffix(7))
     case .month: return Array(days.suffix(30))
     case .all: return days
@@ -126,7 +131,8 @@ struct Estimate: Sendable, Equatable, Codable {
   }
 
   static let empty = Estimate(
-    today: Slice(), week: Slice(), month: Slice(), allTime: Slice(), hasLogs: true, fingerprint: "")
+    today: Slice(), yesterday: Slice(), week: Slice(), month: Slice(), allTime: Slice(),
+    hasLogs: true, fingerprint: "")
 }
 
 struct TokenRates: Sendable, Equatable {
@@ -134,6 +140,19 @@ struct TokenRates: Sendable, Equatable {
   var output: Double
   var cacheRead: Double
   var cacheWrite: Double
+  /// One-hour cache writes, which Claude Code uses for long prompts. Anthropic charges 2× input.
+  var cacheWriteLong: Double
+
+  init(
+    input: Double, output: Double, cacheRead: Double, cacheWrite: Double,
+    cacheWriteLong: Double? = nil
+  ) {
+    self.input = input
+    self.output = output
+    self.cacheRead = cacheRead
+    self.cacheWrite = cacheWrite
+    self.cacheWriteLong = cacheWriteLong ?? input * 2
+  }
 }
 
 struct ModelRate: Sendable, Equatable {
@@ -172,12 +191,16 @@ enum Scan {
     home.appendingPathComponent(".t3/userdata/usage-model-rates.json")
   }
 
-  static var snapshotURL: URL {
+  static var snapshotFolder: URL {
     let root =
       FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
       ?? URL(fileURLWithPath: NSTemporaryDirectory())
-    return root.appendingPathComponent("Gaisan/snapshot.json")
+    return root.appendingPathComponent("Gaisan", isDirectory: true)
   }
+
+  static var snapshotURL: URL { snapshotFolder.appendingPathComponent("snapshot.json") }
+  static var historySnapshotURL: URL { snapshotFolder.appendingPathComponent("history.json") }
+  static var ledgerURL: URL { snapshotFolder.appendingPathComponent("ledger.json") }
 
   static var sessionRoots: [URL] {
     [
@@ -202,15 +225,18 @@ enum Scan {
     let modified = (values?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
     let size = (values?[.size] as? NSNumber)?.intValue ?? 0
     let day = Int(Calendar.current.startOfDay(for: now).timeIntervalSince1970)
-    return "v3-\(size)-\(modified)-\(day)"
+    return "v5-\(size)-\(modified)-\(day)"
   }
 
   static func fingerprint(
     cache: URL = cacheURL, sessions: [URL] = sessionRoots, now: Date = Date(),
     fileManager: FileManager = .default
   ) -> String {
-    let day = Calendar.current.startOfDay(for: now)
-    let live = Live.mark(since: day, fileManager: fileManager)
+    let calendar = Calendar.current
+    let day = calendar.startOfDay(for: now)
+    // Include yesterday so the Yday tab refreshes when those logs are still growing past midnight.
+    let since = calendar.date(byAdding: .day, value: -1, to: day) ?? day
+    let live = Live.mark(since: since, fileManager: fileManager)
     return
       "\(historyFingerprint(cache: cache, now: now, fileManager: fileManager))-\(live.count)-\(live.bytes)-\(live.newest)"
   }
@@ -236,12 +262,14 @@ enum Scan {
   ) -> Estimate? {
     guard hasLogs(cache: cache, sessions: sessions, fileManager: fileManager) else { return nil }
     let mark = fingerprint(cache: cache, sessions: sessions, now: now, fileManager: fileManager)
+    if let cached = loadSnapshot(matching: mark) { return cached }
+
     let historyMark = historyFingerprint(cache: cache, now: now, fileManager: fileManager)
     let ratesJSON =
       (try? Data(contentsOf: rates)).flatMap {
         try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
       } ?? [:]
-    var history = loadSnapshot(matching: historyMark)
+    var history = loadSnapshot(matching: historyMark, from: historySnapshotURL)
     if history == nil {
       let cacheJSON =
         (try? Data(contentsOf: cache)).flatMap {
@@ -249,21 +277,29 @@ enum Scan {
         } ?? [:]
       var folded = fold(cache: cacheJSON, rates: ratesJSON, now: now)
       folded.fingerprint = historyMark
-      saveSnapshot(folded)
+      saveSnapshot(folded, to: historySnapshotURL)
       history = folded
     }
+
+    // Live Claude and Codex logs cover everything after the usage-scan cache. Without that cache,
+    // they cover the last 30 days.
     let cacheDate =
       (try? fileManager.attributesOfItem(atPath: cache.path))?[.modificationDate]
       as? Date
     let startOfToday = Calendar.current.startOfDay(for: now)
-    let cutoff = [cacheDate, startOfToday].compactMap { $0 }.max() ?? startOfToday
-    let extra = Live.events(since: cutoff, fileManager: fileManager)
+    let cutoff =
+      cacheDate
+      ?? Calendar.current.date(byAdding: .day, value: -30, to: startOfToday) ?? startOfToday
+    let live = LiveLedger.shared.events(
+      since: cutoff, keepingEarlier: cacheDate == nil, trees: trees(from: sessions),
+      fileManager: fileManager)
     var estimate = history ?? Estimate.empty
-    if !extra.isEmpty {
-      estimate = plus(fold(cache: [:], rates: ratesJSON, now: now, extra: extra), onto: estimate)
+    if !live.isEmpty {
+      estimate = plus(fold(cache: [:], rates: ratesJSON, now: now, extra: live), onto: estimate)
     }
     estimate.hasLogs = true
     estimate.fingerprint = mark
+    saveSnapshot(estimate)
     return estimate
   }
 
@@ -278,24 +314,28 @@ enum Scan {
       current.other += bucket.other
       days[bucket.id] = current
     }
-    let hours: [StackBucket]
-    if base.hours.count == 24, overlay.hours.count == 24 {
-      hours = zip(base.hours, overlay.hours).map { left, right in
-        StackBucket(
-          id: left.id, claude: left.claude + right.claude, codex: left.codex + right.codex,
-          grok: left.grok + right.grok, pi: left.pi + right.pi, other: left.other + right.other)
-      }
-    } else {
-      hours = overlay.hours.isEmpty ? base.hours : overlay.hours
-    }
+    let hours = mergeHours(base.hours, overlay.hours)
+    let yesterdayHours = mergeHours(base.yesterdayHours, overlay.yesterdayHours)
     let orderedDays =
       base.days.isEmpty
       ? overlay.days
       : base.days.map { days[$0.id] ?? $0 }
     return Estimate(
-      today: add(base.today, overlay.today), week: add(base.week, overlay.week),
-      month: add(base.month, overlay.month), allTime: add(base.allTime, overlay.allTime),
-      hours: hours, days: orderedDays, hasLogs: true, fingerprint: "")
+      today: add(base.today, overlay.today), yesterday: add(base.yesterday, overlay.yesterday),
+      week: add(base.week, overlay.week), month: add(base.month, overlay.month),
+      allTime: add(base.allTime, overlay.allTime), hours: hours, yesterdayHours: yesterdayHours,
+      days: orderedDays, hasLogs: true, fingerprint: "")
+  }
+
+  private static func mergeHours(_ left: [StackBucket], _ right: [StackBucket]) -> [StackBucket] {
+    if left.count == 24, right.count == 24 {
+      return zip(left, right).map { a, b in
+        StackBucket(
+          id: a.id, claude: a.claude + b.claude, codex: a.codex + b.codex, grok: a.grok + b.grok,
+          pi: a.pi + b.pi, other: a.other + b.other)
+      }
+    }
+    return right.isEmpty ? left : right
   }
 
   private static func add(_ left: Slice, _ right: Slice) -> Slice {
@@ -352,14 +392,18 @@ enum Scan {
     let files = cache["files"] as? [String: Any] ?? [:]
     let calendar = Calendar.current
     let startOfToday = calendar.startOfDay(for: now)
+    let startOfYesterday =
+      calendar.date(byAdding: .day, value: -1, to: startOfToday) ?? startOfToday
     let weekAgo = calendar.date(byAdding: .day, value: -7, to: now) ?? now
     let monthAgo = calendar.date(byAdding: .day, value: -30, to: now) ?? now
     let chartStart = calendar.date(byAdding: .day, value: -89, to: startOfToday) ?? startOfToday
     var today = Bucket()
+    var yesterday = Bucket()
     var week = Bucket()
     var month = Bucket()
     var allTime = Bucket()
     var hours = Array(repeating: [String: Double](), count: 24)
+    var yesterdayHours = Array(repeating: [String: Double](), count: 24)
     var days: [Int: [String: Double]] = [:]
 
     for (_, value) in files {
@@ -392,6 +436,10 @@ enum Scan {
         if stamp >= startOfToday {
           today.add(provider: provider, session: session, model: model, priced: priced)
           hours[calendar.component(.hour, from: stamp)][provider, default: 0] += priced.cost
+        } else if stamp >= startOfYesterday {
+          yesterday.add(provider: provider, session: session, model: model, priced: priced)
+          yesterdayHours[calendar.component(.hour, from: stamp)][provider, default: 0] +=
+            priced.cost
         }
         if stamp >= chartStart {
           let day = Int(calendar.startOfDay(for: stamp).timeIntervalSince1970.rounded())
@@ -403,7 +451,8 @@ enum Scan {
     for event in extra {
       let priced = pricing(
         model: event.model, speed: event.speed, uncached: event.uncached, cached: event.cached,
-        created: event.created, output: event.output, reported: event.reported, table: table)
+        created: event.created, createdLong: event.createdLong, output: event.output,
+        reported: event.reported, table: table)
       allTime.add(
         provider: event.provider, session: event.session, model: event.model, priced: priced)
       if event.stamp >= monthAgo {
@@ -419,6 +468,11 @@ enum Scan {
           provider: event.provider, session: event.session, model: event.model, priced: priced)
         hours[calendar.component(.hour, from: event.stamp)][event.provider, default: 0] +=
           priced.cost
+      } else if event.stamp >= startOfYesterday {
+        yesterday.add(
+          provider: event.provider, session: event.session, model: event.model, priced: priced)
+        yesterdayHours[calendar.component(.hour, from: event.stamp)][event.provider, default: 0] +=
+          priced.cost
       }
       if event.stamp >= chartStart {
         let day = Int(calendar.startOfDay(for: event.stamp).timeIntervalSince1970.rounded())
@@ -428,9 +482,11 @@ enum Scan {
 
     let known = allTime.slice().sources
     return Estimate(
-      today: today.slice(carrying: known), week: week.slice(carrying: known),
-      month: month.slice(carrying: known), allTime: allTime.slice(),
+      today: today.slice(carrying: known), yesterday: yesterday.slice(carrying: known),
+      week: week.slice(carrying: known), month: month.slice(carrying: known),
+      allTime: allTime.slice(),
       hours: (0..<24).map { StackBucket.from(hours[$0], id: "h\($0)") },
+      yesterdayHours: (0..<24).map { StackBucket.from(yesterdayHours[$0], id: "yh\($0)") },
       days: paddedDays(days, from: chartStart, through: startOfToday, calendar: calendar),
       hasLogs: true, fingerprint: "")
   }
@@ -452,17 +508,18 @@ enum Scan {
   /// `reportedCostUsd` wins when the provider already priced the row.
   static func price(
     model: String?, speed: String, uncached: Double, cached: Double, created: Double,
-    output: Double, reported: Double?, table: [String: ModelRate]
+    createdLong: Double = 0, output: Double, reported: Double?, table: [String: ModelRate]
   ) -> Double {
     pricing(
       model: model, speed: speed, uncached: uncached, cached: cached, created: created,
-      output: output, reported: reported, table: table
+      createdLong: createdLong, output: output, reported: reported, table: table
     ).cost
   }
 
+  /// `createdLong` is the part of `created` written to the one-hour cache.
   static func pricing(
     model: String?, speed: String, uncached: Double, cached: Double, created: Double,
-    output: Double, reported: Double?, table: [String: ModelRate]
+    createdLong: Double = 0, output: Double, reported: Double?, table: [String: ModelRate]
   ) -> Pricing {
     let reportedCost = reported.flatMap { $0.isFinite ? $0 : nil }
     guard let rate = lookup(model, in: table) else {
@@ -477,7 +534,8 @@ enum Scan {
     let used = ratesAt(rate, speed)
     let input = uncached * used.input
     let cacheRead = cached * used.cacheRead
-    let cacheWrite = created * used.cacheWrite
+    let long = min(max(createdLong, 0), created)
+    let cacheWrite = (created - long) * used.cacheWrite + long * used.cacheWriteLong
     let outputCost = output * used.output
     let list = input + cacheRead + cacheWrite + outputCost
     let savings = cached * (used.input - used.cacheRead)
@@ -635,7 +693,12 @@ enum Scan {
       number(entry["cache_creation_input_token_cost\(suffix)"])
       ?? scaledCache(standard?.cacheWrite, standardInput: standard?.input, input: input)
       ?? input
-    return TokenRates(input: input, output: output, cacheRead: cacheRead, cacheWrite: cacheWrite)
+    let cacheWriteLong =
+      number(entry["cache_creation_input_token_cost_above_1hr\(suffix)"])
+      ?? scaledCache(standard?.cacheWriteLong, standardInput: standard?.input, input: input)
+    return TokenRates(
+      input: input, output: output, cacheRead: cacheRead, cacheWrite: cacheWrite,
+      cacheWriteLong: cacheWriteLong)
   }
 
   private static func scaledCache(_ field: Double?, standardInput: Double?, input: Double)
@@ -655,7 +718,8 @@ enum Scan {
   private static func scale(_ rates: TokenRates, by multiple: Double) -> TokenRates {
     TokenRates(
       input: rates.input * multiple, output: rates.output * multiple,
-      cacheRead: rates.cacheRead * multiple, cacheWrite: rates.cacheWrite * multiple)
+      cacheRead: rates.cacheRead * multiple, cacheWrite: rates.cacheWrite * multiple,
+      cacheWriteLong: rates.cacheWriteLong * multiple)
   }
 
   private static func normalize(_ model: String) -> String {
@@ -687,5 +751,60 @@ enum Scan {
     if let n = any as? NSNumber { return n.intValue }
     if let s = any as? String { return Int(s) }
     return nil
+  }
+}
+
+/// Keeps the live ledger between refreshes, so each one reads only the bytes the logs gained, and
+/// saves it so the next launch doesn't start over.
+final class LiveLedger: @unchecked Sendable {
+  static let shared = LiveLedger(url: Scan.ledgerURL)
+
+  private let url: URL
+  private let lock = NSLock()
+  private var ledger: Live.Ledger?
+  private var savedAt = Date.distantPast
+
+  init(url: URL) { self.url = url }
+
+  /// `keepingEarlier` keeps a ledger that starts before `since`, so a rolling cutoff doesn't make
+  /// every new day reread the logs.
+  func events(
+    since: Date, keepingEarlier: Bool = false, trees: [(provider: String, root: URL)],
+    fileManager: FileManager = .default, now: Date = Date()
+  ) -> [Live.Event] {
+    lock.withLock {
+      var current = ledger ?? load()
+      if let held = current?.since, held != since, !(keepingEarlier && held < since) {
+        current = nil
+      }
+      let since = current?.since ?? since
+      var next = current ?? Live.Ledger(since: since)
+      let before = next.events.count
+      if !Live.advance(&next, trees: trees, fileManager: fileManager) {
+        next = Live.Ledger(since: since)
+        _ = Live.advance(&next, trees: trees, fileManager: fileManager)
+      }
+      ledger = next
+      // Saving rewrites the whole ledger, so do it at most once a minute while logs stream.
+      if current == nil || (next.events.count != before && now.timeIntervalSince(savedAt) > 60) {
+        save(next)
+        savedAt = now
+      }
+      return next.events
+    }
+  }
+
+  private func load() -> Live.Ledger? {
+    guard let data = try? Data(contentsOf: url) else { return nil }
+    return try? PropertyListDecoder().decode(Live.Ledger.self, from: data)
+  }
+
+  private func save(_ ledger: Live.Ledger) {
+    try? FileManager.default.createDirectory(
+      at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let encoder = PropertyListEncoder()
+    encoder.outputFormat = .binary
+    guard let data = try? encoder.encode(ledger) else { return }
+    try? data.write(to: url, options: .atomic)
   }
 }

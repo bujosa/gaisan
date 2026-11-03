@@ -9,5 +9,6 @@ if pkill -x Gaisan 2>/dev/null; then
 fi
 rm -rf "$app"
 ditto "$root/dist/Gaisan.app" "$app"
-open "$app"
+# LaunchServices can still refuse a bundle it just saw replaced (-600); one retry is enough.
+open "$app" 2>/dev/null || { sleep 1; open "$app"; }
 echo "Opened: $app"

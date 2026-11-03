@@ -42,7 +42,7 @@ Download the zip for your Mac from the [releases page](https://github.com/bujosa
 ./scripts/install.sh
 ```
 
-That builds a universal release binary (arm64 and x86_64), installs `~/Applications/Gaisan.app`, and opens it. `./scripts/package.sh` writes the signed universal app plus one signed zip and SHA-256 checksum per chip, `dist/Gaisan-0.2.0-macOS-apple-silicon.zip` and `dist/Gaisan-0.2.0-macOS-intel.zip`, without installing anything. It stops if either architecture is missing.
+That builds a universal release binary (arm64 and x86_64), installs `~/Applications/Gaisan.app`, and opens it. `./scripts/package.sh` writes the signed universal app plus one signed zip and SHA-256 checksum per chip, `dist/Gaisan-0.3.0-macOS-apple-silicon.zip` and `dist/Gaisan-0.3.0-macOS-intel.zip`, without installing anything. It stops if either architecture is missing.
 
 Run `swift test` for estimate folding, live Claude/Codex log parsing, cache-aware prices, snapshot reuse, and idle Grok rows. Run `swift build -c release --arch arm64 --arch x86_64` to check the release build. CI runs both, plus `swift format lint --strict` and a script check, on every pull request.
 
@@ -50,7 +50,7 @@ Run `swift test` for estimate folding, live Claude/Codex log parsing, cache-awar
 
 ## What the panel shows
 
-- **Today / 7d / 30d / All.** The same local logs, cut to that window. The menu bar always shows today.
+- **Today / Yday / 7d / 30d / All.** The same local logs, cut to that window. The menu bar always shows today. All and the longer windows keep growing from live Claude and Codex logs even when the usage-scan cache is stale.
 - **Sources.** Claude, Codex, Grok, and Pi when those logs exist on this Mac. A quiet source still appears as a dash so the mix does not jump around.
 - **Mix.** Uncached input, cache reads, cache writes, and output, priced separately. Cache savings is what those reads would have cost at the uncached input rate.
 - **Models.** Highest spend first in the selected window.
@@ -70,7 +70,7 @@ Gaisan reads files already on this Mac. It does not ask for an API key and it do
 | Grok | `~/.grok/sessions` |
 | Pi | `~/.pi/agent/sessions` |
 
-Today is priced from the session logs themselves. Gaisan watches `~/.claude/projects` and `~/.codex/sessions` and folds new Claude assistant usage and Codex `token_usage_record` lines as they land. A longer history still folds from `~/.t3/userdata/usage-scan-cache-v5.json` when that file is present, with rates from `~/.t3/userdata/usage-model-rates.json`. Pricing uses uncached input, cache reads, cache writes, and output. Reasoning tokens are already inside output. A snapshot at `~/Library/Caches/Gaisan/snapshot.json` keeps the panel instant on the next open.
+Everything after the usage-scan cache is priced from the session logs themselves. Gaisan watches `~/.claude/projects` and `~/.codex/sessions` and folds Claude assistant usage and Codex `token_usage_record` lines from the moment that cache last changed. A Codex session keeps writing to the day folder it started in, so Gaisan follows every log that changed, not just recent folders. It remembers how far it read each log in `~/Library/Caches/Gaisan/ledger.json` and reads only what was appended, so a refresh stays fast even with multi-gigabyte sessions. Without the cache, the logs cover the last 30 days, and All grows from there. A longer history folds from `~/.t3/userdata/usage-scan-cache-v5.json` when that file is present, with rates from `~/.t3/userdata/usage-model-rates.json`. Pricing uses uncached input, cache reads, cache writes (Claude's one-hour writes at their own rate), and output. Reasoning tokens are already inside output. A snapshot at `~/Library/Caches/Gaisan/snapshot.json` keeps the panel instant on the next open.
 
 This is an estimate, not a statement from Anthropic, OpenAI, xAI, or anyone else.
 
