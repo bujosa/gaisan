@@ -42,7 +42,7 @@ Download the zip for your Mac from the [releases page](https://github.com/bujosa
 ./scripts/install.sh
 ```
 
-That builds a universal release binary (arm64 and x86_64), installs `~/Applications/Gaisan.app`, and opens it. `./scripts/package.sh` writes the signed universal app plus one signed zip and SHA-256 checksum per chip, `dist/Gaisan-0.2.0-macOS-apple-silicon.zip` and `dist/Gaisan-0.2.0-macOS-intel.zip`, without installing anything. It stops if either architecture is missing.
+That builds a universal release binary (arm64 and x86_64), installs `~/Applications/Gaisan.app`, and opens it. `./scripts/package.sh` writes the signed universal app plus one signed zip and SHA-256 checksum per chip, `dist/Gaisan-0.3.0-macOS-apple-silicon.zip` and `dist/Gaisan-0.3.0-macOS-intel.zip`, without installing anything. It stops if either architecture is missing.
 
 Run `swift test` for estimate folding, live Claude/Codex log parsing, cache-aware prices, snapshot reuse, and idle Grok rows. Run `swift build -c release --arch arm64 --arch x86_64` to check the release build. CI runs both, plus `swift format lint --strict` and a script check, on every pull request.
 

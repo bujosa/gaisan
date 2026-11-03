@@ -1,7 +1,7 @@
 #!/bin/bash
 # Installs or updates Gaisan from the latest GitHub release, picking the build for this Mac's chip:
 #   curl -fsSL https://raw.githubusercontent.com/bujosa/gaisan/main/scripts/get.sh | bash
-# GAISAN_VERSION=0.2.0 picks a release. GAISAN_INSTALL_DIR picks the folder (default ~/Applications, or
+# GAISAN_VERSION=0.3.0 picks a release. GAISAN_INSTALL_DIR picks the folder (default ~/Applications, or
 # /Applications when Gaisan is already there).
 set -euo pipefail
 
