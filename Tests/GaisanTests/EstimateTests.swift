@@ -244,6 +244,82 @@ struct EstimateTests {
     #expect(missing == nil)
   }
 
+  @Test func codexSessionInAnOlderDayFolderStillCounts() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "gaisan-codex-tree-\(UUID().uuidString)")
+    let old = root.appendingPathComponent("2026/09/12")
+    try FileManager.default.createDirectory(at: old, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    try Data((codexTurn + "\n" + codexUsage("2026-11-01T10:00:01.000Z") + "\n").utf8)
+      .write(to: old.appendingPathComponent("rollout.jsonl"))
+    let events = Live.events(
+      since: Date(timeIntervalSince1970: 1_793_500_000), trees: [("codex", root)])
+    #expect(events.count == 1)
+    #expect(events.first?.model == "gpt-6.1-sol")
+  }
+
+  @Test func ledgerReadsOnlyAppendedLinesAndWaitsForUnfinishedOnes() throws {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "gaisan-ledger-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let file = folder.appendingPathComponent("rollout.jsonl")
+    let first = codexTurn + "\n" + codexUsage("2026-11-01T10:00:01.000Z") + "\n"
+    try Data(first.utf8).write(to: file)
+    var ledger = Live.Ledger(since: Date(timeIntervalSince1970: 1_793_500_000))
+    #expect(Live.advance(&ledger, trees: [("codex", folder)]))
+    #expect(ledger.events.count == 1)
+
+    let second = codexUsage("2026-11-01T10:00:02.000Z")
+    let handle = try FileHandle(forWritingTo: file)
+    try handle.seekToEnd()
+    try handle.write(contentsOf: Data((second + "\n" + String(second.prefix(40))).utf8))
+    #expect(Live.advance(&ledger, trees: [("codex", folder)]))
+    #expect(ledger.events.count == 2)
+    #expect(ledger.events.allSatisfy { $0.model == "gpt-6.1-sol" })
+
+    try handle.write(contentsOf: Data((String(second.dropFirst(40)) + "\n").utf8))
+    try handle.close()
+    #expect(Live.advance(&ledger, trees: [("codex", folder)]))
+    #expect(ledger.events.count == 3)
+    #expect(Live.advance(&ledger, trees: [("codex", folder)]))
+    #expect(ledger.events.count == 3)
+  }
+
+  @Test func shrunkLogAsksForANewLedger() throws {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "gaisan-shrink-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let file = folder.appendingPathComponent("rollout.jsonl")
+    try Data((codexTurn + "\n" + codexUsage("2026-11-01T10:00:01.000Z") + "\n").utf8).write(
+      to: file)
+    var ledger = Live.Ledger(since: Date(timeIntervalSince1970: 1_793_500_000))
+    #expect(Live.advance(&ledger, trees: [("codex", folder)]))
+    try Data((codexTurn + "\n").utf8).write(to: file)
+    #expect(!Live.advance(&ledger, trees: [("codex", folder)]))
+  }
+
+  private let codexTurn =
+    #"{"timestamp":"2026-11-01T10:00:00.000Z","type":"turn_context","payload":{"model":"gpt-6.1-sol"}}"#
+
+  private func codexUsage(_ stamp: String) -> String {
+    #"{"timestamp":""# + stamp
+      + #"","type":"token_usage_record","payload":{"session_id":"s","usage":{"input_tokens":150,"cached_input_tokens":50,"output_tokens":20}}}"#
+  }
+
+  @Test func oneHourCacheWritesUseTheirOwnRate() {
+    let table = Scan.parseRateTable(opusRates)
+    let short = Scan.price(
+      model: "claude-opus-5-5", speed: "standard", uncached: 0, cached: 0, created: 1_000_000,
+      output: 0, reported: nil, table: table)
+    let long = Scan.price(
+      model: "claude-opus-5-5", speed: "standard", uncached: 0, cached: 0, created: 1_000_000,
+      createdLong: 1_000_000, output: 0, reported: nil, table: table)
+    #expect(abs(short - 5) < 0.0001)
+    #expect(abs(long - 8) < 0.0001)
+  }
+
   private var opusRates: [String: Any] {
     [
       "claude-opus-5-5": [
@@ -251,6 +327,7 @@ struct EstimateTests {
         "output_cost_per_token": 0.00002,
         "cache_read_input_token_cost": 0.0000002,
         "cache_creation_input_token_cost": 0.000005,
+        "cache_creation_input_token_cost_above_1hr": 0.000008,
       ]
     ]
   }

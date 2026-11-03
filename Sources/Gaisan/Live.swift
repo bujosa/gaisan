@@ -1,7 +1,7 @@
 import Foundation
 
 enum Live {
-  struct Event: Sendable, Equatable {
+  struct Event: Sendable, Equatable, Codable {
     var stamp: Date
     var provider: String
     var session: Int
@@ -10,6 +10,8 @@ enum Live {
     var uncached: Double
     var cached: Double
     var created: Double
+    /// Part of `created` written to Claude's one-hour cache.
+    var createdLong: Double = 0
     var output: Double
     var reported: Double?
   }
@@ -40,7 +42,7 @@ enum Live {
     var mark = Mark()
     var newest = Date(timeIntervalSince1970: 0)
     for tree in trees {
-      for url in files(tree, since: since, fileManager: fileManager) {
+      for url in jsonlFiles(root: tree.root, since: since, fileManager: fileManager) {
         let values = try? fileManager.attributesOfItem(atPath: url.path)
         let modified = values?[.modificationDate] as? Date ?? since
         let size = (values?[.size] as? NSNumber)?.intValue ?? 0
@@ -53,57 +55,138 @@ enum Live {
     return mark
   }
 
+  /// Every event after `since`, read from scratch. The app keeps a `Ledger` instead, so a refresh
+  /// parses only what each log gained.
   static func events(
     since: Date, trees: [(provider: String, root: URL)] = liveTrees(),
     fileManager: FileManager = .default
   ) -> [Event] {
+    var ledger = Ledger(since: since)
+    _ = advance(&ledger, trees: trees, fileManager: fileManager)
+    return ledger.events
+  }
+
+  /// How far one log was read, plus the context a later line needs.
+  struct Tail: Codable, Sendable, Equatable {
+    var offset: UInt64 = 0
+    /// Codex names the model in `turn_context`, not on each usage line.
+    var model: String?
+    var session: Int?
+    /// Claude repeats a request's usage on each content block; these were already counted.
+    var recent: [String] = []
+  }
+
+  /// Events after `since` from every Claude and Codex log, with each log's read position. Logs only
+  /// grow, so `advance` reads just the appended bytes.
+  struct Ledger: Codable, Sendable {
+    var since: Date
+    var tails: [String: Tail] = [:]
     var events: [Event] = []
-    for tree in trees {
-      for url in files(tree, since: since, fileManager: fileManager) {
-        switch tree.provider {
-        case "claude": events.append(contentsOf: claudeEvents(from: url, since: since))
-        case "codex": events.append(contentsOf: codexEvents(from: url, since: since))
-        default: continue
+  }
+
+  /// Reads what each log gained since the last pass. Returns false when a log shrank or was
+  /// replaced; the caller then starts a new ledger.
+  static func advance(
+    _ ledger: inout Ledger, trees: [(provider: String, root: URL)] = liveTrees(),
+    fileManager: FileManager = .default
+  ) -> Bool {
+    for tree in trees where tree.provider == "claude" || tree.provider == "codex" {
+      // A Codex session keeps writing to the day folder it started in, so walk the whole tree
+      // and let modification dates pick the files. Only appended bytes are read.
+      for url in jsonlFiles(root: tree.root, since: ledger.since, fileManager: fileManager) {
+        let size =
+          ((try? fileManager.attributesOfItem(atPath: url.path))?[.size] as? NSNumber)?
+          .uint64Value ?? 0
+        var tail =
+          ledger.tails[url.path]
+          ?? Tail(session: sessionNumber(url.deletingPathExtension().lastPathComponent))
+        if size < tail.offset { return false }
+        if size == tail.offset { continue }
+        let since = ledger.since
+        let provider = tree.provider
+        var added: [Event] = []
+        let reached = readLines(of: url, from: tail.offset) { line in
+          switch provider {
+          case "claude": return claudeLine(line, since: since, tail: &tail, into: &added)
+          default: return codexLine(line, since: since, tail: &tail, into: &added)
+          }
         }
+        guard let reached else { continue }
+        tail.offset = reached
+        ledger.tails[url.path] = tail
+        ledger.events.append(contentsOf: added)
       }
     }
-    return events
+    return true
   }
 
-  private static func files(
-    _ tree: (provider: String, root: URL), since: Date, fileManager: FileManager
-  ) -> [URL] {
-    switch tree.provider {
-    case "codex": return codexFiles(root: tree.root, since: since, fileManager: fileManager)
-    default: return jsonlFiles(root: tree.root, since: since, fileManager: fileManager)
+  private static let claudeNeedles = [Array(#""type":"assistant""#.utf8), Array(#""usage""#.utf8)]
+  private static let codexUsage = Array(#""type":"token_usage_record""#.utf8)
+  private static let codexTurn = Array(#""type":"turn_context""#.utf8)
+
+  /// Handles one Claude line. Returns false only when the line is not valid JSON.
+  private static func claudeLine(
+    _ line: UnsafeRawBufferPointer, since: Date, tail: inout Tail, into events: inout [Event]
+  ) -> Bool {
+    guard claudeNeedles.allSatisfy({ contains(line, $0) }) else { return true }
+    guard let object = object(line) else { return false }
+    guard object["type"] as? String == "assistant" else { return true }
+    let message = object["message"] as? [String: Any] ?? [:]
+    guard let usage = message["usage"] as? [String: Any] else { return true }
+    guard let stamp = date(object["timestamp"]) ?? date(object["timestampMs"]), stamp > since
+    else { return true }
+    if let request = (object["requestId"] as? String).flatMap({ $0.isEmpty ? nil : $0 }) {
+      if tail.recent.contains(request) { return true }
+      tail.recent.append(request)
+      if tail.recent.count > 64 { tail.recent.removeFirst(tail.recent.count - 64) }
     }
+    let id = (object["sessionId"] as? String) ?? (object["session_id"] as? String)
+    let speed = (usage["speed"] as? String)?.lowercased() ?? "standard"
+    events.append(
+      Event(
+        stamp: stamp, provider: "claude", session: id.map(sessionNumber) ?? tail.session ?? 0,
+        model: message["model"] as? String, speed: speed,
+        uncached: number(usage["input_tokens"]) ?? 0,
+        cached: number(usage["cache_read_input_tokens"]) ?? 0,
+        created: number(usage["cache_creation_input_tokens"]) ?? 0,
+        createdLong: number(
+          (usage["cache_creation"] as? [String: Any])?["ephemeral_1h_input_tokens"]) ?? 0,
+        output: number(usage["output_tokens"]) ?? 0, reported: nil))
+    return true
   }
 
-  private static func codexFiles(root: URL, since: Date, fileManager: FileManager) -> [URL] {
-    if let names = try? fileManager.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) {
-      let jsonl = names.filter { $0.pathExtension == "jsonl" }
-      if !jsonl.isEmpty { return jsonl }
+  /// Handles one Codex line. Returns false only when the line is not valid JSON.
+  private static func codexLine(
+    _ line: UnsafeRawBufferPointer, since: Date, tail: inout Tail, into events: inout [Event]
+  ) -> Bool {
+    // Both types sit right after the timestamp; looking only there skips tool output that
+    // happens to mention them.
+    let head = UnsafeRawBufferPointer(rebasing: line.prefix(160))
+    let isUsage = contains(head, codexUsage)
+    guard isUsage || contains(head, codexTurn) else { return true }
+    guard let object = object(line) else { return false }
+    let payload = object["payload"] as? [String: Any] ?? [:]
+    let type = object["type"] as? String
+    if type == "turn_context", let next = payload["model"] as? String, !next.isEmpty {
+      tail.model = next
     }
-    let calendar = Calendar.current
-    let today = calendar.startOfDay(for: Date())
-    // Only day folders from the cache cutoff forward — never walk multi-gigabyte older months.
-    var day = calendar.startOfDay(for: since)
-    var files: [URL] = []
-    while day <= today {
-      let year = calendar.component(.year, from: day)
-      let month = calendar.component(.month, from: day)
-      let dayNumber = calendar.component(.day, from: day)
-      let folder = root.appendingPathComponent(
-        String(format: "%04d/%02d/%02d", year, month, dayNumber))
-      if let names = try? fileManager.contentsOfDirectory(
-        at: folder, includingPropertiesForKeys: nil)
-      {
-        files.append(contentsOf: names.filter { $0.pathExtension == "jsonl" })
-      }
-      guard let next = calendar.date(byAdding: .day, value: 1, to: day), next > day else { break }
-      day = next
+    guard type == "token_usage_record", let usage = payload["usage"] as? [String: Any] else {
+      return true
     }
-    return files
+    if let session = payload["session_id"] as? String, !session.isEmpty {
+      tail.session = sessionNumber(session)
+    }
+    guard let stamp = date(object["timestamp"]) ?? date(payload["timestamp"]), stamp > since
+    else { return true }
+    let input = number(usage["input_tokens"]) ?? 0
+    let cached = number(usage["cached_input_tokens"]) ?? 0
+    events.append(
+      Event(
+        stamp: stamp, provider: "codex", session: tail.session ?? 0, model: tail.model,
+        speed: "standard", uncached: max(0, input - cached), cached: cached,
+        created: number(usage["cache_write_input_tokens"]) ?? 0,
+        output: number(usage["output_tokens"]) ?? 0, reported: number(payload["cost_usd"])))
+    return true
   }
 
   private static func jsonlFiles(root: URL, since: Date, fileManager: FileManager) -> [URL] {
@@ -125,90 +208,56 @@ enum Live {
     return files
   }
 
-  private static func claudeEvents(from url: URL, since: Date) -> [Event] {
-    var events: [Event] = []
-    var seen: Set<String> = []
-    forEachLine(in: url) { line in
-      guard line.contains("\"usage\"") else { return }
-      guard let object = object(line) else { return }
-      guard object["type"] as? String == "assistant" else { return }
-      let message = object["message"] as? [String: Any] ?? [:]
-      guard let usage = message["usage"] as? [String: Any] else { return }
-      guard let stamp = date(object["timestamp"]) ?? date(object["timestampMs"]), stamp > since
-      else { return }
-      let request = (object["requestId"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-      if let request, !seen.insert(request).inserted { return }
-      let session = sessionNumber(
-        (object["sessionId"] as? String) ?? (object["session_id"] as? String)
-          ?? url.deletingPathExtension()
-          .lastPathComponent)
-      let speed = (usage["speed"] as? String)?.lowercased() ?? "standard"
-      events.append(
-        Event(
-          stamp: stamp, provider: "claude", session: session, model: message["model"] as? String,
-          speed: speed, uncached: number(usage["input_tokens"]) ?? 0,
-          cached: number(usage["cache_read_input_tokens"]) ?? 0,
-          created: number(usage["cache_creation_input_tokens"]) ?? 0,
-          output: number(usage["output_tokens"]) ?? 0, reported: nil))
-    }
-    return events
-  }
-
-  private static func codexEvents(from url: URL, since: Date) -> [Event] {
-    var events: [Event] = []
-    var model: String?
-    var fallbackSession = sessionNumber(url.deletingPathExtension().lastPathComponent)
-    forEachLine(in: url) { line in
-      guard line.contains("token_usage_record") || line.contains("turn_context") else { return }
-      guard let object = object(line) else { return }
-      let payload = object["payload"] as? [String: Any] ?? [:]
-      let type = object["type"] as? String
-      if type == "turn_context", let next = payload["model"] as? String, !next.isEmpty {
-        model = next
-      }
-      guard type == "token_usage_record" else { return }
-      guard let usage = payload["usage"] as? [String: Any] else { return }
-      guard let stamp = date(object["timestamp"]) ?? date(payload["timestamp"]), stamp > since
-      else { return }
-      if let session = payload["session_id"] as? String, !session.isEmpty {
-        fallbackSession = sessionNumber(session)
-      }
-      let input = number(usage["input_tokens"]) ?? 0
-      let cached = number(usage["cached_input_tokens"]) ?? 0
-      events.append(
-        Event(
-          stamp: stamp, provider: "codex", session: fallbackSession, model: model,
-          speed: "standard", uncached: max(0, input - cached), cached: cached,
-          created: number(usage["cache_write_input_tokens"]) ?? 0,
-          output: number(usage["output_tokens"]) ?? 0, reported: number(payload["cost_usd"])))
-    }
-    return events
-  }
-
-  private static func forEachLine(in url: URL, body: (String) -> Void) {
-    guard let handle = try? FileHandle(forReadingFrom: url) else { return }
+  /// Calls `body` for each complete line after `offset` and returns the offset after the last line
+  /// handled, or nil when the file can't be opened. A last line without a newline counts only when
+  /// `body` accepts it, so a line still being written is read again next time.
+  private static func readLines(
+    of url: URL, from offset: UInt64, body: (UnsafeRawBufferPointer) -> Bool
+  ) -> UInt64? {
+    guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
     defer { try? handle.close() }
-    var buffer = Data()
-    while true {
-      let chunk = (try? handle.read(upToCount: 64 * 1024)) ?? Data()
-      if chunk.isEmpty {
-        if !buffer.isEmpty, let line = String(data: buffer, encoding: .utf8) { body(line) }
-        break
+    guard (try? handle.seek(toOffset: offset)) != nil else { return nil }
+    var reached = offset
+    var buffer: [UInt8] = []
+    var searchFrom = 0
+    while let chunk = try? handle.read(upToCount: 4 << 20), !chunk.isEmpty {
+      buffer.append(contentsOf: chunk)
+      var lineStart = 0
+      buffer.withUnsafeBytes { bytes in
+        guard let base = bytes.baseAddress else { return }
+        var cursor = searchFrom
+        while cursor < bytes.count, let hit = memchr(base + cursor, 10, bytes.count - cursor) {
+          let end = base.distance(to: UnsafeRawPointer(hit))
+          _ = body(UnsafeRawBufferPointer(rebasing: bytes[lineStart..<end]))
+          lineStart = end + 1
+          cursor = lineStart
+        }
       }
-      buffer.append(chunk)
-      while let newline = buffer.firstIndex(of: 10) {
-        let lineData = buffer.subdata(in: 0..<newline)
-        buffer.removeSubrange(0...newline)
-        if let line = String(data: lineData, encoding: .utf8) { body(line) }
-      }
+      reached += UInt64(lineStart)
+      buffer.removeFirst(lineStart)
+      searchFrom = buffer.count
     }
+    if !buffer.isEmpty {
+      let accepted = buffer.withUnsafeBytes { bytes in
+        // An unfinished line fails to parse; an irrelevant one waits for the next newline.
+        body(bytes) && object(bytes) != nil
+      }
+      if accepted { reached += UInt64(buffer.count) }
+    }
+    return reached
   }
 
-  private static func object(_ line: String) -> [String: Any]? {
-    guard let data = line.data(using: .utf8),
-      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-    else { return nil }
-    return object
+  private static func contains(_ haystack: UnsafeRawBufferPointer, _ needle: [UInt8]) -> Bool {
+    guard let base = haystack.baseAddress, haystack.count >= needle.count else { return false }
+    return needle.withUnsafeBytes { memmem(base, haystack.count, $0.baseAddress, needle.count) }
+      != nil
+  }
+
+  private static func object(_ bytes: UnsafeRawBufferPointer) -> [String: Any]? {
+    guard let base = bytes.baseAddress, bytes.count > 1 else { return nil }
+    let data = Data(
+      bytesNoCopy: UnsafeMutableRawPointer(mutating: base), count: bytes.count, deallocator: .none)
+    return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
   }
 
   private static func date(_ any: Any?) -> Date? {
